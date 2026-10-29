@@ -10,7 +10,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <mach-o/dyld.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <math.h>
 #include <signal.h>
 #include <spawn.h>
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 extern char **environ;
 
@@ -47,8 +50,6 @@ typedef int (*MTContactCallback)(MTDeviceRef, MTTouch *, int, double, int);
 static CFArrayRef (*MTDeviceCreateList)(void);
 static void (*MTRegisterContactFrameCallback)(MTDeviceRef, MTContactCallback);
 static void (*MTDeviceStart)(MTDeviceRef, int);
-static void (*MTDeviceStop)(MTDeviceRef);
-static void (*MTUnregisterContactFrameCallback)(MTDeviceRef, MTContactCallback);
 static OSStatus (*MTDeviceGetFamilyID)(MTDeviceRef, int *);
 
 // ---- Bindings: edit these ----
@@ -291,8 +292,6 @@ static bool loadFramework(void) {
     MTRegisterContactFrameCallback = dlsym(h, "MTRegisterContactFrameCallback");
     MTDeviceStart = dlsym(h, "MTDeviceStart");
     MTDeviceGetFamilyID = dlsym(h, "MTDeviceGetFamilyID");  // optional
-    MTDeviceStop = dlsym(h, "MTDeviceStop");                // optional
-    MTUnregisterContactFrameCallback = dlsym(h, "MTUnregisterContactFrameCallback");  // optional
     if (!MTDeviceCreateList || !MTRegisterContactFrameCallback || !MTDeviceStart) {
         fprintf(stderr, "MultitouchSupport is missing expected symbols\n");
         return false;
@@ -300,19 +299,9 @@ static bool loadFramework(void) {
     return true;
 }
 
-// Registers every trackpad and returns how many were found. Any previously registered
-// devices are stopped first, so this can be called again to pick up new device objects.
+// Registers every trackpad and returns how many were found.
 static int startDevices(void) {
-    for (int i = 0; i < deviceCount; i++) {
-        if (MTUnregisterContactFrameCallback) MTUnregisterContactFrameCallback(devices[i].dev, onFrame);
-        if (MTDeviceStop) MTDeviceStop(devices[i].dev);
-    }
-    static CFArrayRef list;
-    if (list) CFRelease(list);
-    memset(devices, 0, sizeof devices);
-    deviceCount = 0;
-
-    list = MTDeviceCreateList();
+    CFArrayRef list = MTDeviceCreateList();
     for (CFIndex i = 0; list && i < CFArrayGetCount(list) && deviceCount < MAX_DEVICES; i++) {
         MTDeviceRef dev = (MTDeviceRef)CFArrayGetValueAtIndex(list, i);
         int family = -1;
@@ -331,25 +320,25 @@ static int startDevices(void) {
 }
 
 // ---- Wake handling ----
-// After a long sleep macOS can recreate the multitouch devices, leaving the old ones
-// silent while this process keeps running. Rescan a few seconds after each wake.
+// After sleep the trackpads can go silent for this process, and registering them again
+// in-process doesn't bring them back; a fresh process does. So a few seconds after each
+// wake, re-exec this binary with the same arguments.
 
-#define WAKE_RESCAN_DELAY_SEC 3.0
-#define WAKE_RESCAN_TRIES 5
+#define WAKE_RESTART_DELAY_SEC 3.0
 
 static io_connect_t rootPort;
-static CFRunLoopTimerRef rescanTimer;
-static int rescanTriesLeft;
+static CFRunLoopTimerRef restartTimer;
+static char **savedArgv;
 
-static void onRescanTimer(CFRunLoopTimerRef timer, void *info) {
+static void onRestartTimer(CFRunLoopTimerRef timer, void *info) {
     (void)timer, (void)info;
-    printf("woke: rescanning trackpads\n");
-    if (startDevices() > 0 || --rescanTriesLeft <= 0) {
-        if (deviceCount == 0) fprintf(stderr, "no trackpads found after wake\n");
-        CFRunLoopTimerSetNextFireDate(rescanTimer, INFINITY);
-    } else {
-        CFRunLoopTimerSetNextFireDate(rescanTimer, CFAbsoluteTimeGetCurrent() + WAKE_RESCAN_DELAY_SEC);
-    }
+    char path[4096];
+    uint32_t size = sizeof path;
+    if (_NSGetExecutablePath(path, &size) != 0) snprintf(path, sizeof path, "%s", savedArgv[0]);
+    printf("woke: restarting\n");
+    fflush(stdout);
+    execv(path, savedArgv);
+    fprintf(stderr, "restart failed: %s\n", strerror(errno));
 }
 
 static void onPower(void *refcon, io_service_t service, natural_t type, void *arg) {
@@ -360,8 +349,7 @@ static void onPower(void *refcon, io_service_t service, natural_t type, void *ar
         IOAllowPowerChange(rootPort, (long)arg);
         break;
     case kIOMessageSystemHasPoweredOn:
-        rescanTriesLeft = WAKE_RESCAN_TRIES;
-        CFRunLoopTimerSetNextFireDate(rescanTimer, CFAbsoluteTimeGetCurrent() + WAKE_RESCAN_DELAY_SEC);
+        CFRunLoopTimerSetNextFireDate(restartTimer, CFAbsoluteTimeGetCurrent() + WAKE_RESTART_DELAY_SEC);
         break;
     }
 }
@@ -371,15 +359,16 @@ static void watchWake(void) {
     io_object_t notifier;
     rootPort = IORegisterForSystemPower(NULL, &port, onPower, &notifier);
     if (!rootPort) {
-        fprintf(stderr, "warning: cannot watch for wake; trackpads won't be rescanned after sleep\n");
+        fprintf(stderr, "warning: cannot watch for wake; trackpads may go silent after sleep\n");
         return;
     }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(port), kCFRunLoopCommonModes);
-    rescanTimer = CFRunLoopTimerCreate(NULL, INFINITY, 1e9, 0, 0, onRescanTimer, NULL);
-    CFRunLoopAddTimer(CFRunLoopGetCurrent(), rescanTimer, kCFRunLoopCommonModes);
+    restartTimer = CFRunLoopTimerCreate(NULL, INFINITY, 1e9, 0, 0, onRestartTimer, NULL);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), restartTimer, kCFRunLoopCommonModes);
 }
 
 int main(int argc, char **argv) {
+    savedArgv = argv;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dry-run")) dryRun = true;
         else if (!strcmp(argv[i], "--debug")) debug = true;

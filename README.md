@@ -54,5 +54,5 @@ These can be passed as arguments (add them to `ProgramArguments` in `~/Library/L
 ## Caveats
 
 - `MultitouchSupport` is undocumented and may break with a macOS update.
-- Trackpads are found at startup and again a few seconds after each wake from sleep. Connecting a Magic Trackpad while awake still needs a restart (`launchctl kickstart -k gui/$(id -u)/tpgest`).
+- Trackpads can go silent after sleep, so tpgest restarts itself (re-execs) a few seconds after each wake. Connecting a Magic Trackpad while awake still needs a restart (`launchctl kickstart -k gui/$(id -u)/tpgest`).
 - Turn off any macOS trackpad gesture that uses the same fingers and direction (System Settings → Trackpad → More Gestures), or both will fire.
