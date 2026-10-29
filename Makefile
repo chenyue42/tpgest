@@ -1,7 +1,7 @@
 PLIST = $(HOME)/Library/LaunchAgents/tpgest.plist
 
 tpgest: tpgest.c
-	clang -O2 -Wall -Wextra -o $@ $< -framework ApplicationServices -framework CoreFoundation
+	clang -O2 -Wall -Wextra -o $@ $< -framework ApplicationServices -framework CoreFoundation -framework IOKit
 
 # Run at login as a LaunchAgent, with this checkout's binary
 install: tpgest

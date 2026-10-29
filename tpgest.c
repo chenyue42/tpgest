@@ -8,6 +8,8 @@
 
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dlfcn.h>
 #include <math.h>
 #include <signal.h>
@@ -45,6 +47,8 @@ typedef int (*MTContactCallback)(MTDeviceRef, MTTouch *, int, double, int);
 static CFArrayRef (*MTDeviceCreateList)(void);
 static void (*MTRegisterContactFrameCallback)(MTDeviceRef, MTContactCallback);
 static void (*MTDeviceStart)(MTDeviceRef, int);
+static void (*MTDeviceStop)(MTDeviceRef);
+static void (*MTUnregisterContactFrameCallback)(MTDeviceRef, MTContactCallback);
 static OSStatus (*MTDeviceGetFamilyID)(MTDeviceRef, int *);
 
 // ---- Bindings: edit these ----
@@ -287,11 +291,92 @@ static bool loadFramework(void) {
     MTRegisterContactFrameCallback = dlsym(h, "MTRegisterContactFrameCallback");
     MTDeviceStart = dlsym(h, "MTDeviceStart");
     MTDeviceGetFamilyID = dlsym(h, "MTDeviceGetFamilyID");  // optional
+    MTDeviceStop = dlsym(h, "MTDeviceStop");                // optional
+    MTUnregisterContactFrameCallback = dlsym(h, "MTUnregisterContactFrameCallback");  // optional
     if (!MTDeviceCreateList || !MTRegisterContactFrameCallback || !MTDeviceStart) {
         fprintf(stderr, "MultitouchSupport is missing expected symbols\n");
         return false;
     }
     return true;
+}
+
+// Registers every trackpad and returns how many were found. Any previously registered
+// devices are stopped first, so this can be called again to pick up new device objects.
+static int startDevices(void) {
+    for (int i = 0; i < deviceCount; i++) {
+        if (MTUnregisterContactFrameCallback) MTUnregisterContactFrameCallback(devices[i].dev, onFrame);
+        if (MTDeviceStop) MTDeviceStop(devices[i].dev);
+    }
+    static CFArrayRef list;
+    if (list) CFRelease(list);
+    memset(devices, 0, sizeof devices);
+    deviceCount = 0;
+
+    list = MTDeviceCreateList();
+    for (CFIndex i = 0; list && i < CFArrayGetCount(list) && deviceCount < MAX_DEVICES; i++) {
+        MTDeviceRef dev = (MTDeviceRef)CFArrayGetValueAtIndex(list, i);
+        int family = -1;
+        if (MTDeviceGetFamilyID) MTDeviceGetFamilyID(dev, &family);
+        if (isMouseFamily(family)) {
+            printf("skipping mouse (family %d)\n", family);
+            continue;
+        }
+        printf("dev%d: trackpad family %d\n", deviceCount, family);
+        devices[deviceCount++].dev = dev;
+        MTRegisterContactFrameCallback(dev, onFrame);
+        MTDeviceStart(dev, 0);
+    }
+    fflush(stdout);
+    return deviceCount;
+}
+
+// ---- Wake handling ----
+// After a long sleep macOS can recreate the multitouch devices, leaving the old ones
+// silent while this process keeps running. Rescan a few seconds after each wake.
+
+#define WAKE_RESCAN_DELAY_SEC 3.0
+#define WAKE_RESCAN_TRIES 5
+
+static io_connect_t rootPort;
+static CFRunLoopTimerRef rescanTimer;
+static int rescanTriesLeft;
+
+static void onRescanTimer(CFRunLoopTimerRef timer, void *info) {
+    (void)timer, (void)info;
+    printf("woke: rescanning trackpads\n");
+    if (startDevices() > 0 || --rescanTriesLeft <= 0) {
+        if (deviceCount == 0) fprintf(stderr, "no trackpads found after wake\n");
+        CFRunLoopTimerSetNextFireDate(rescanTimer, INFINITY);
+    } else {
+        CFRunLoopTimerSetNextFireDate(rescanTimer, CFAbsoluteTimeGetCurrent() + WAKE_RESCAN_DELAY_SEC);
+    }
+}
+
+static void onPower(void *refcon, io_service_t service, natural_t type, void *arg) {
+    (void)refcon, (void)service;
+    switch (type) {
+    case kIOMessageCanSystemSleep:
+    case kIOMessageSystemWillSleep:
+        IOAllowPowerChange(rootPort, (long)arg);
+        break;
+    case kIOMessageSystemHasPoweredOn:
+        rescanTriesLeft = WAKE_RESCAN_TRIES;
+        CFRunLoopTimerSetNextFireDate(rescanTimer, CFAbsoluteTimeGetCurrent() + WAKE_RESCAN_DELAY_SEC);
+        break;
+    }
+}
+
+static void watchWake(void) {
+    IONotificationPortRef port;
+    io_object_t notifier;
+    rootPort = IORegisterForSystemPower(NULL, &port, onPower, &notifier);
+    if (!rootPort) {
+        fprintf(stderr, "warning: cannot watch for wake; trackpads won't be rescanned after sleep\n");
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(port), kCFRunLoopCommonModes);
+    rescanTimer = CFRunLoopTimerCreate(NULL, INFINITY, 1e9, 0, 0, onRescanTimer, NULL);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), rescanTimer, kCFRunLoopCommonModes);
 }
 
 int main(int argc, char **argv) {
@@ -313,24 +398,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "warning: no Accessibility permission; shortcuts will not be delivered.\n"
                         "Grant it to this binary (or your terminal) in System Settings > Privacy & Security > Accessibility.\n");
 
-    CFArrayRef list = MTDeviceCreateList();
-    for (CFIndex i = 0; list && i < CFArrayGetCount(list) && deviceCount < MAX_DEVICES; i++) {
-        MTDeviceRef dev = (MTDeviceRef)CFArrayGetValueAtIndex(list, i);
-        int family = -1;
-        if (MTDeviceGetFamilyID) MTDeviceGetFamilyID(dev, &family);
-        if (isMouseFamily(family)) {
-            printf("skipping mouse (family %d)\n", family);
-            continue;
-        }
-        printf("dev%d: trackpad family %d\n", deviceCount, family);
-        devices[deviceCount++].dev = dev;
-        MTRegisterContactFrameCallback(dev, onFrame);
-        MTDeviceStart(dev, 0);
-    }
-    if (deviceCount == 0) {
+    if (startDevices() == 0) {
         fprintf(stderr, "no trackpads found\n");
         return 1;
     }
+    watchWake();
     printf("listening%s\n", dryRun ? " (dry run)" : "");
     fflush(stdout);
     CFRunLoopRun();
